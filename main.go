@@ -15,10 +15,10 @@ import (
 	"time"
 )
 
-func DownloadFile(url string, path string) (*http.Header, error) {
+func DownloadFile(url string, path string) (*http.Response, error) {
 	resp, err := http.Get(url)
-	if err != nil {
-		return nil, err
+	if err != nil && resp.StatusCode == http.StatusOK {
+		return resp, fmt.Errorf("Bad StatusCode")
 	}
 	defer resp.Body.Close()
 
@@ -29,7 +29,7 @@ func DownloadFile(url string, path string) (*http.Header, error) {
 	defer out.Close()
 
 	_, err = io.Copy(out, resp.Body)
-	return &resp.Header, nil
+	return resp, nil
 }
 
 type Metadata struct {
@@ -60,6 +60,7 @@ func DownloadHandler(w http.ResponseWriter, r *http.Request) {
 
 	metadata := fmt.Sprintf("cache/%s.json", sum)
 	filename := fmt.Sprintf("cache/%s", sum)
+	statusCode := http.StatusBadGateway
 	fmt.Printf("%s %s -> %s\n", r.RemoteAddr, filename, r.URL.String())
 
 	// Lock the filesystem for concurrent access. Since our application doesn't write to the same file multiple times,
@@ -70,11 +71,11 @@ func DownloadHandler(w http.ResponseWriter, r *http.Request) {
 
 	conditionMutex.Lock()
 	c, inProgress := downloadedFiles[sum]
-  conditionMutex.Unlock()
+	conditionMutex.Unlock()
 
 	var meta *Metadata
 	if inProgress {
-    // If this operation fails, that's okay. The channel was closed.
+		// If this operation fails, that's okay. The channel was closed.
 		_, _ = <-c
 		meta = LoadMetadata(metadata)
 	} else {
@@ -91,33 +92,37 @@ func DownloadHandler(w http.ResponseWriter, r *http.Request) {
 			conditionMutex.Unlock()
 
 			// TODO: Make this configurable.
-			headers, err := DownloadFile(fmt.Sprintf("http://archive.ubuntu.com/%s", r.URL.String()), filename)
+			resp, err := DownloadFile(fmt.Sprintf("http://archive.ubuntu.com/%s", r.URL.String()), filename)
 
-      // XXX: Checking this IS NOT an error to simplify the logic.
-			if err == nil {
-        meta = &Metadata {
-          URL: uri,
-          ContentLength: headers.Get("Content-Length"),
-          LastModified: headers.Get("Last-Modified"),
-          ContentType: headers.Get("Content-Type"),
-        }
+			// XXX: Checking this IS NOT an error to simplify the logic.
+			if err == nil && resp.StatusCode == http.StatusOK {
+				meta = &Metadata {
+					URL: uri,
+					ContentLength: resp.Header.Get("Content-Length"),
+					LastModified: resp.Header.Get("Last-Modified"),
+					ContentType: resp.Header.Get("Content-Type"),
+				}
 
-        b, _ := json.Marshal(meta)
-        _ = ioutil.WriteFile(metadata, b, 0644)
-      }
+				b, _ := json.Marshal(meta)
+				_ = ioutil.WriteFile(metadata, b, 0644)
+			}
 
-      // Closing the channel signals to everything we are done (error or not).
+			// Pass status code through.
+			statusCode = resp.StatusCode
+
+			// Closing the channel signals to everything we are done (error or not).
 			conditionMutex.Lock()
-      close(c)
+			delete(downloadedFiles, sum)
+			close(c)
 			conditionMutex.Unlock()
 		}
 	}
 
-  // This check simplifies the above code in the error cases.
-  if meta == nil {
-    w.WriteHeader(http.StatusNotFound)
-    return
-  }
+	// This check simplifies the above code in the error cases.
+	if meta == nil {
+		w.WriteHeader(statusCode)
+		return
+	}
 
 	// Finally send file.
 	w.Header().Set("Last-Modified", meta.LastModified)
@@ -128,7 +133,7 @@ func DownloadHandler(w http.ResponseWriter, r *http.Request) {
 
 func main() {
 
-  downloadedFiles = make(map[string]chan struct{})
+	downloadedFiles = make(map[string]chan struct{})
 
 	go func() {
 		for {
